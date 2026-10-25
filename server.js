@@ -5,25 +5,36 @@ fs.mkdirSync(DIR+'/up',{recursive:true});
 const F=DIR+'/db.json';let D={users:{},sess:{},docs:{}};try{D=JSON.parse(fs.readFileSync(F))}catch(e){}
 let st;const save=()=>{clearTimeout(st);st=setTimeout(()=>{fs.writeFileSync(F+'.tmp',JSON.stringify(D));fs.renameSync(F+'.tmp',F)},300)};
 // collection -> field that holds the author's id (server forces it to the logged-in user)
-const OWN={blocks:'a',posts:'uid',stories:'uid',comments:'u',likes:'u',saves:'u',follows:'a',messages:'a',views:'u',votes:'u',profiles:'uid'};
+const OWN={reads:'u',reports:'u',blocks:'a',posts:'uid',stories:'uid',comments:'u',likes:'u',saves:'u',follows:'a',messages:'a',views:'u',votes:'u',profiles:'uid'};
 const rnd=n=>crypto.randomBytes(n).toString('hex'),sha=s=>crypto.createHash('sha256').update(s).digest('hex');
 const hashPw=(pw,salt=rnd(16))=>salt+':'+crypto.scryptSync(pw,salt,64).toString('hex');
 const chkPw=(pw,h)=>{const[s,x]=h.split(':'),y=crypto.scryptSync(String(pw),s,64).toString('hex');return crypto.timingSafeEqual(Buffer.from(x),Buffer.from(y))};
 const body=(req,max)=>new Promise((ok,no)=>{const b=[];let n=0;req.on('data',c=>{n+=c.length;if(n>max){no(new Error('too big'));req.destroy()}else b.push(c)});req.on('end',()=>ok(Buffer.concat(b)));req.on('error',no)});
 const send=(res,code,obj,hd={})=>{res.writeHead(code,{'Content-Type':'application/json','Cache-Control':'no-store',...hd});res.end(JSON.stringify(obj))};
 const cookie=req=>Object.fromEntries((req.headers.cookie||'').split(/;\s*/).filter(Boolean).map(c=>c.split('=')));
-const auth=req=>{const t=cookie(req).vsid;if(!t)return null;const s=D.sess[sha(t)];if(!s||s.exp<Date.now())return null;const u=D.users[s.uid];return u?{uid:s.uid,username:u.username}:null};
+const tok=req=>{const a=req.headers.authorization||'';return a.startsWith('Bearer ')?a.slice(7):cookie(req).vsid};
+const auth=req=>{const t=tok(req);if(!t)return null;const s=D.sess[sha(t)];if(!s||s.exp<Date.now())return null;const u=D.users[s.uid];return u?{uid:s.uid,username:u.username}:null};
 const tries={},limited=k=>{const n=Date.now(),a=(tries[k]||[]).filter(t=>n-t<6e5);tries[k]=a;return a.length>=10};
-const sess=(req,uid)=>{const t=rnd(32);D.sess[sha(t)]={uid,exp:Date.now()+365*864e5};save();return{'Set-Cookie':`vsid=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${365*86400}${req.headers['x-forwarded-proto']=='https'?'; Secure':''}`}};
+const sess=(req,uid)=>{const t=rnd(32);D.sess[sha(t)]={uid,exp:Date.now()+365*864e5};save();return{'Set-Cookie':`vsid=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${365*86400}${req.headers['x-forwarded-proto']=='https'?'; Secure':''}`,'X-Vang-Token':t}};
 const rcode=()=>{const r=rnd(5);return r.slice(0,5)+'-'+r.slice(5)};
 const CLR={'Set-Cookie':'vsid=; HttpOnly; Path=/; Max-Age=0'};
 const dropSess=uid=>{for(const k in D.sess)if(D.sess[k].uid==uid)delete D.sess[k]};
-const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript','.webmanifest':'application/manifest+json','.png':'image/png','.svg':'image/svg+xml','.jpg':'image/jpeg','.gif':'image/gif','.webp':'image/webp'};
+const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript','.webmanifest':'application/manifest+json','.png':'image/png','.svg':'image/svg+xml','.mp4':'video/mp4','.webm':'video/webm','.jpg':'image/jpeg','.gif':'image/gif','.webp':'image/webp'};
 const json=async(req,max)=>{try{const j=JSON.parse((await body(req,max)).toString()||'{}');return j&&typeof j=='object'&&!Array.isArray(j)?j:{}}catch(e){return{}}};
 
+const listCol=(col,me)=>{let l=Object.entries(D.docs[col]||{}).map(([i,x])=>({id:i,...x.d}));
+ if(col=='messages')l=l.filter(x=>String(x.pair).split('|').includes(me.uid));
+ if(col=='saves'||col=='reports')l=l.filter(x=>x.u==me.uid);
+ if(col=='blocks')l=l.filter(x=>x.a==me.uid||x.b==me.uid);
+ if(col=='reads')l=l.filter(x=>String(x.k).split('|').includes(me.uid));
+ if(col=='follows')l=l.filter(x=>x.st!='pending'||x.a==me.uid||x.b==me.uid);
+ if(col=='posts'||col=='stories'){const pv=new Set(Object.entries(D.docs.profiles||{}).filter(([,x])=>x.d.priv).map(([i])=>i)),ok=new Set(Object.values(D.docs.follows||{}).filter(x=>x.d.a==me.uid&&x.d.st!='pending').map(x=>x.d.b));l=l.filter(x=>(x.uid==me.uid||!pv.has(x.uid)||ok.has(x.uid))&&!(x.arch&&x.uid!=me.uid))}
+ return l.sort((a,b)=>(b.at||0)-(a.at||0)).slice(0,600)};
 http.createServer(async(req,res)=>{try{
 const u=new URL(req.url,'http://x'),p=u.pathname,m=req.method;
 res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','same-origin');
+res.setHeader('Access-Control-Allow-Origin',process.env.ALLOW_ORIGIN||'*');res.setHeader('Access-Control-Allow-Headers','Content-Type,X-Vang,Authorization');res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');res.setHeader('Access-Control-Expose-Headers','X-Vang-Token');
+if(m=='OPTIONS'){res.writeHead(204);return res.end()}
 if(p.startsWith('/api/')){
  if(m!='GET'&&req.headers['x-vang']!='1')return send(res,403,{error:'bad request'});
  if(p=='/api/reset'&&m=='POST'){const b=await json(req,2000),un=String(b.username||'').trim().toLowerCase(),key='r'+req.socket.remoteAddress+un;
@@ -49,26 +60,29 @@ if(p.startsWith('/api/')){
  const me=auth(req);
  if(p=='/api/me')return send(res,200,me||{uid:null});
  if(!me)return send(res,401,{error:'login'});
- if(p=='/api/logout'){delete D.sess[sha(cookie(req).vsid||'')];save();return send(res,200,{ok:1},CLR)}
+ if(p=='/api/logout'){delete D.sess[sha(tok(req)||'')];save();return send(res,200,{ok:1},CLR)}
  if(p=='/api/password'){const b=await json(req,2000);
   if(!chkPw(b.old||'',D.users[me.uid].pw))return send(res,401,{error:'wrong current password'});
   const n=String(b.new||'');if(n.length<8||n.length>100)return send(res,400,{error:'new password needs 8+ characters'});
   D.users[me.uid].pw=hashPw(n);dropSess(me.uid);return send(res,200,{ok:1},sess(req,me.uid))}
  if(p=='/api/recovery'&&m=='POST'){const b=await json(req,2000);if(!chkPw(b.password||'',D.users[me.uid].pw))return send(res,401,{error:'wrong password'});const rc=rcode();D.users[me.uid].rc=hashPw(rc);save();return send(res,200,{recovery:rc})}
  if(p=='/api/account'&&m=='DELETE'){for(const c in D.docs)for(const i in D.docs[c])if(D.docs[c][i].o==me.uid)delete D.docs[c][i];dropSess(me.uid);delete D.users[me.uid];save();return send(res,200,{ok:1},CLR)}
- if(p=='/api/upload'&&m=='POST'){const b=await body(req,8e6),t=b.subarray(0,12);let x=null;
+ if(p=='/api/upload'&&m=='POST'){const b=await body(req,30e6),t=b.subarray(0,12);let x=null,vid=false;
   if(t[0]==0xff&&t[1]==0xd8)x='jpg';else if(t[0]==0x89&&t.subarray(1,4).toString()=='PNG')x='png';else if(t.subarray(0,3).toString()=='GIF')x='gif';else if(t.subarray(0,4).toString()=='RIFF'&&t.subarray(8,12).toString()=='WEBP')x='webp';
-  if(!x)return send(res,400,{error:'images only (jpg, png, gif, webp)'});const id=rnd(16);fs.writeFileSync(`${DIR}/up/${id}.${x}`,b);return send(res,200,{id})}
+  else if(t.subarray(4,8).toString()=='ftyp'){x='mp4';vid=true}else if(t[0]==0x1a&&t[1]==0x45&&t[2]==0xdf&&t[3]==0xa3){x='webm';vid=true}
+  if(!x)return send(res,400,{error:'use jpg, png, gif, webp, mp4 or webm'});if(!vid&&b.length>8e6)return send(res,400,{error:'photo too big (max 8MB)'});
+  const id=rnd(16);fs.writeFileSync(`${DIR}/up/${id}.${x}`,b);return send(res,200,{id,k:vid?'v':'i'})}
+ if(p=='/api/sync'&&m=='GET'){const o={};for(const c in OWN)o[c]=listCol(c,me);return send(res,200,o)}
  const mm=p.match(/^\/api\/c\/(\w+)(?:\/([\w.-]{1,120}))?$/);if(!mm||!OWN[mm[1]])return send(res,404,{error:'not found'});
  const col=mm[1];let id=mm[2];const C=D.docs[col]=D.docs[col]||{};
- if(m=='GET'&&!id){let l=Object.entries(C).map(([i,x])=>({id:i,...x.d}));
-  if(col=='messages')l=l.filter(x=>String(x.pair).split('|').includes(me.uid));if(col=='saves')l=l.filter(x=>x.u==me.uid);if(col=='blocks')l=l.filter(x=>x.a==me.uid||x.b==me.uid);
-  return send(res,200,l.sort((a,b)=>(b.at||0)-(a.at||0)).slice(0,600))}
- if(m=='DELETE'){if(!id||!C[id])return send(res,200,{ok:1});if(C[id].o!=me.uid&&!(col=='comments'&&(D.docs.posts||{})[C[id].d.p]?.o==me.uid))return send(res,403,{error:'not yours'});delete C[id];save();return send(res,200,{ok:1})}
+ if(m=='GET'&&!id)return send(res,200,listCol(col,me));
+ if(m=='DELETE'){if(!id||!C[id])return send(res,200,{ok:1});if(C[id].o!=me.uid&&!(col=='comments'&&(D.docs.posts||{})[C[id].d.p]?.o==me.uid)&&!(col=='follows'&&C[id].d.b==me.uid))return send(res,403,{error:'not yours'});delete C[id];save();return send(res,200,{ok:1})}
  if(['POST','PUT','PATCH'].includes(m)){
   if(m=='POST'&&id||m!='POST'&&!id)return send(res,400,{error:'bad path'});
   const d=await json(req,20000);delete d.id;d[OWN[col]]=me.uid;if(m=='POST')id=rnd(10);
-  const ok={likes:id.endsWith('_'+me.uid),saves:id.endsWith('_'+me.uid),views:id.endsWith('_'+me.uid),votes:id.endsWith('_'+me.uid),follows:id.startsWith(me.uid+'_'),blocks:id.startsWith(me.uid+'_'),profiles:id==me.uid}[col];
+  if(col=='follows'){const o0=C[id];if(m=='PATCH'&&o0&&o0.d.b==me.uid){o0.d.st='ok';save();return send(res,200,{id})}
+   if(m=='PATCH')delete d.st;else{if(id!=me.uid+'_'+d.b)return send(res,403,{error:'bad id'});d.st=(D.docs.profiles||{})[d.b]?.d.priv?'pending':'ok'}}
+  const ok={likes:id.endsWith('_'+me.uid),saves:id.endsWith('_'+me.uid),views:id.endsWith('_'+me.uid),votes:id.endsWith('_'+me.uid),follows:id.startsWith(me.uid+'_'),blocks:id.startsWith(me.uid+'_'),reads:id.endsWith('_'+me.uid),profiles:id==me.uid}[col];
   if(ok===false)return send(res,403,{error:'bad id'});
   if(col=='messages'){const pp=String(d.pair).split('|');if(!pp.includes(me.uid))return send(res,403,{error:'bad chat'});const ot=pp.find(x=>x!=me.uid);if(Object.values(D.docs.blocks||{}).some(x=>(x.d.a==me.uid&&x.d.b==ot)||(x.d.a==ot&&x.d.b==me.uid)))return send(res,403,{error:'cannot message this user'})}
   if(col=='profiles')d.username=me.username;
@@ -77,9 +91,11 @@ if(p.startsWith('/api/')){
   save();return send(res,200,{id})}
  return send(res,405,{});
 }
-if(p.startsWith('/_blob/')){if(!auth(req)){res.writeHead(401);return res.end()}
+if(p.startsWith('/_blob/')){
  const id=p.slice(7);if(!/^[0-9a-f]{32}$/.test(id)){res.writeHead(404);return res.end()}
- for(const x of['jpg','png','gif','webp']){const f=`${DIR}/up/${id}.${x}`;if(fs.existsSync(f)){res.writeHead(200,{'Content-Type':MIME['.'+(x=='jpg'?'jpg':x)],'Cache-Control':'private, max-age=31536000, immutable'});return fs.createReadStream(f).pipe(res)}}
+ for(const x of['jpg','png','gif','webp','mp4','webm']){const f=`${DIR}/up/${id}.${x}`;if(fs.existsSync(f)){const sz=fs.statSync(f).size,hd={'Content-Type':MIME['.'+x],'Accept-Ranges':'bytes','Cache-Control':'public, max-age=31536000, immutable'},rg=/bytes=(\d*)-(\d*)/.exec(req.headers.range||'');
+  if(rg){let a0=rg[1]?+rg[1]:0,e0=rg[2]?+rg[2]:sz-1;if(!rg[1]&&rg[2]){a0=sz-(+rg[2]);e0=sz-1}e0=Math.min(e0,sz-1);if(a0>e0||a0>=sz){res.writeHead(416,{'Content-Range':'bytes */'+sz});return res.end()}res.writeHead(206,{...hd,'Content-Range':`bytes ${a0}-${e0}/${sz}`,'Content-Length':e0-a0+1});return fs.createReadStream(f,{start:a0,end:e0}).pipe(res)}
+  res.writeHead(200,{...hd,'Content-Length':sz});return fs.createReadStream(f).pipe(res)}}
  res.writeHead(404);return res.end()}
 const PUBLIC=['index.html','sw.js','manifest.webmanifest','icon-192.png','icon-512.png'],nm=p=='/'?'index.html':p.slice(1);
 if(!PUBLIC.includes(nm)){res.writeHead(404);return res.end('not found')}
