@@ -3,9 +3,10 @@ const http=require('http'),fs=require('fs'),path=require('path'),crypto=require(
 const PORT=process.env.PORT||3000,DIR=process.env.DATA_DIR||path.join(__dirname,'data'),PUB=__dirname;
 fs.mkdirSync(DIR+'/up',{recursive:true});
 const F=DIR+'/db.json';let D={users:{},sess:{},docs:{}};try{D=JSON.parse(fs.readFileSync(F))}catch(e){}
-let st;const save=()=>{clearTimeout(st);st=setTimeout(()=>{fs.writeFileSync(F+'.tmp',JSON.stringify(D));fs.renameSync(F+'.tmp',F)},300)};
+const clients=new Set();let bct;const bcast=()=>{clearTimeout(bct);bct=setTimeout(()=>{for(const r of clients){try{r.write('data: 1\n\n')}catch(e){clients.delete(r)}}},60)};
+let st;const save=()=>{bcast();clearTimeout(st);st=setTimeout(()=>{fs.writeFileSync(F+'.tmp',JSON.stringify(D));fs.renameSync(F+'.tmp',F)},300)};
 // collection -> field that holds the author's id (server forces it to the logged-in user)
-const OWN={reads:'u',reports:'u',blocks:'a',posts:'uid',stories:'uid',comments:'u',likes:'u',saves:'u',follows:'a',messages:'a',views:'u',votes:'u',profiles:'uid'};
+const OWN={cfriends:'a',reads:'u',reports:'u',blocks:'a',posts:'uid',stories:'uid',comments:'u',likes:'u',saves:'u',follows:'a',messages:'a',views:'u',votes:'u',profiles:'uid'};
 const rnd=n=>crypto.randomBytes(n).toString('hex'),sha=s=>crypto.createHash('sha256').update(s).digest('hex');
 const hashPw=(pw,salt=rnd(16))=>salt+':'+crypto.scryptSync(pw,salt,64).toString('hex');
 const chkPw=(pw,h)=>{const[s,x]=h.split(':'),y=crypto.scryptSync(String(pw),s,64).toString('hex');return crypto.timingSafeEqual(Buffer.from(x),Buffer.from(y))};
@@ -22,13 +23,31 @@ const dropSess=uid=>{for(const k in D.sess)if(D.sess[k].uid==uid)delete D.sess[k
 const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript','.webmanifest':'application/manifest+json','.png':'image/png','.svg':'image/svg+xml','.mp4':'video/mp4','.webm':'video/webm','.jpg':'image/jpeg','.gif':'image/gif','.webp':'image/webp'};
 const json=async(req,max)=>{try{const j=JSON.parse((await body(req,max)).toString()||'{}');return j&&typeof j=='object'&&!Array.isArray(j)?j:{}}catch(e){return{}}};
 
-const listCol=(col,me)=>{let l=Object.entries(D.docs[col]||{}).map(([i,x])=>({id:i,...x.d}));
- if(col=='messages')l=l.filter(x=>String(x.pair).split('|').includes(me.uid));
- if(col=='saves'||col=='reports')l=l.filter(x=>x.u==me.uid);
- if(col=='blocks')l=l.filter(x=>x.a==me.uid||x.b==me.uid);
- if(col=='reads')l=l.filter(x=>String(x.k).split('|').includes(me.uid));
- if(col=='follows')l=l.filter(x=>x.st!='pending'||x.a==me.uid||x.b==me.uid);
- if(col=='posts'||col=='stories'){const pv=new Set(Object.entries(D.docs.profiles||{}).filter(([,x])=>x.d.priv).map(([i])=>i)),ok=new Set(Object.values(D.docs.follows||{}).filter(x=>x.d.a==me.uid&&x.d.st!='pending').map(x=>x.d.b));l=l.filter(x=>(x.uid==me.uid||!pv.has(x.uid)||ok.has(x.uid))&&!(x.arch&&x.uid!=me.uid))}
+const DAY=864e5;
+function ctx(me){const Dd=D.docs,prof=Dd.profiles||{},fol=Object.values(Dd.follows||{}).map(x=>x.d),blk=Object.values(Dd.blocks||{}).map(x=>x.d);
+ const priv=new Set(Object.entries(prof).filter(([,x])=>x.d.priv).map(([i])=>i)),appr=new Set(fol.filter(f=>f.a==me.uid&&f.st!='pending').map(f=>f.b)),bl=new Set(),bm=new Set();
+ blk.forEach(b=>{if(b.a==me.uid)bl.add(b.b);if(b.b==me.uid){bl.add(b.a);bm.add(b.a)}});
+ const cf=new Set(Object.values(Dd.cfriends||{}).map(x=>x.d).filter(x=>x.b==me.uid).map(x=>x.a)),posts=Dd.posts||{},stor=Dd.stories||{},cms=Dd.comments||{},msgs=Dd.messages||{};
+ const okU=u=>u==me.uid||(!bl.has(u)&&(!priv.has(u)||appr.has(u)));
+ const pOk=id=>{const p=posts[id];return !!p&&okU(p.d.uid)&&(!p.d.arch||p.d.uid==me.uid)};
+ const sOk=id=>{const s=stor[id];if(!s)return false;const d=s.d;if(d.uid==me.uid)return true;if(!okU(d.uid))return false;if(!d.hl&&Date.now()-d.at>DAY)return false;if(d.aud=='cf'&&!cf.has(d.uid))return false;return true};
+ const cOk=id=>{const c=cms[id];return !!c&&pOk(c.d.p)&&!bl.has(c.d.u)};
+ const mOk=id=>{const m=msgs[id];return !!m&&String(m.d.pair).split('|').includes(me.uid)};
+ return{priv,appr,bl,bm,cf,okU,pOk,sOk,cOk,mOk,posts,stor,fol,prof}}
+const listCol=(col,me,X0)=>{const X=X0||ctx(me);let l=Object.entries(D.docs[col]||{}).map(([i,x])=>({id:i,...x.d}));
+ if(col=='messages')l=l.filter(x=>String(x.pair).split('|').includes(me.uid)&&!String(x.pair).split('|').some(u=>u!=me.uid&&X.bl.has(u)));
+ else if(col=='saves'||col=='reports')l=l.filter(x=>x.u==me.uid);
+ else if(col=='blocks'||col=='cfriends')l=l.filter(x=>x.a==me.uid);
+ else if(col=='reads')l=l.filter(x=>String(x.k).split('|').includes(me.uid));
+ else if(col=='follows')l=l.filter(x=>{if(x.a==me.uid||x.b==me.uid)return true;if(x.st=='pending')return false;return X.okU(x.a)&&X.okU(x.b)});
+ else if(col=='posts')l=l.filter(x=>X.pOk(x.id));
+ else if(col=='stories')l=l.filter(x=>X.sOk(x.id));
+ else if(col=='comments')l=l.filter(x=>X.cOk(x.id));
+ else if(col=='likes'){const hid=new Set(Object.entries(X.posts).filter(([,p])=>p.d.hl&&p.d.uid!=me.uid).map(([i])=>i));l=l.filter(x=>(X.pOk(x.p)||X.cOk(x.p)||X.mOk(x.p))&&!X.bl.has(x.u)&&!(hid.has(x.p)&&x.u!=me.uid))}
+ else if(col=='votes')l=l.filter(x=>X.sOk(x.s));
+ else if(col=='views')l=l.filter(x=>X.sOk(x.s)&&(x.u==me.uid||(X.stor[x.s]&&X.stor[x.s].d.uid==me.uid)));
+ else if(col=='profiles'){const fr={},fg={},np={};X.fol.forEach(f=>{if(f.st!='pending'){fr[f.b]=(fr[f.b]||0)+1;fg[f.a]=(fg[f.a]||0)+1}});Object.values(X.posts).forEach(p=>{if(!p.d.arch)np[p.d.uid]=(np[p.d.uid]||0)+1});
+  l=l.filter(x=>!X.bm.has(x.uid||x.id)).map(x=>{const u=x.uid||x.id,o={...x,fr:fr[u]||0,fg:fg[u]||0,np:np[u]||0};if(u!=me.uid&&!X.appr.has(u)){delete o.act;delete o.note;delete o.noteAt}return o})}
  return l.sort((a,b)=>(b.at||0)-(a.at||0)).slice(0,600)};
 http.createServer(async(req,res)=>{try{
 const u=new URL(req.url,'http://x'),p=u.pathname,m=req.method;
@@ -72,7 +91,8 @@ if(p.startsWith('/api/')){
   else if(t.subarray(4,8).toString()=='ftyp'){x='mp4';vid=true}else if(t[0]==0x1a&&t[1]==0x45&&t[2]==0xdf&&t[3]==0xa3){x='webm';vid=true}
   if(!x)return send(res,400,{error:'use jpg, png, gif, webp, mp4 or webm'});if(!vid&&b.length>8e6)return send(res,400,{error:'photo too big (max 8MB)'});
   const id=rnd(16);fs.writeFileSync(`${DIR}/up/${id}.${x}`,b);return send(res,200,{id,k:vid?'v':'i'})}
- if(p=='/api/sync'&&m=='GET'){const o={};for(const c in OWN)o[c]=listCol(c,me);return send(res,200,o)}
+ if(p=='/api/stream'&&m=='GET'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform',Connection:'keep-alive','X-Accel-Buffering':'no'});res.write(': ok\n\n');clients.add(res);const hb=setInterval(()=>{try{res.write(': hb\n\n')}catch(e){}},20000);req.on('close',()=>{clients.delete(res);clearInterval(hb)});return}
+ if(p=='/api/sync'&&m=='GET'){const o={},X=ctx(me);for(const c in OWN)o[c]=listCol(c,me,X);return send(res,200,o)}
  const mm=p.match(/^\/api\/c\/(\w+)(?:\/([\w.-]{1,120}))?$/);if(!mm||!OWN[mm[1]])return send(res,404,{error:'not found'});
  const col=mm[1];let id=mm[2];const C=D.docs[col]=D.docs[col]||{};
  if(m=='GET'&&!id)return send(res,200,listCol(col,me));
@@ -82,10 +102,17 @@ if(p.startsWith('/api/')){
   const d=await json(req,20000);delete d.id;d[OWN[col]]=me.uid;if(m=='POST')id=rnd(10);
   if(col=='follows'){const o0=C[id];if(m=='PATCH'&&o0&&o0.d.b==me.uid){o0.d.st='ok';save();return send(res,200,{id})}
    if(m=='PATCH')delete d.st;else{if(id!=me.uid+'_'+d.b)return send(res,403,{error:'bad id'});d.st=(D.docs.profiles||{})[d.b]?.d.priv?'pending':'ok'}}
-  const ok={likes:id.endsWith('_'+me.uid),saves:id.endsWith('_'+me.uid),views:id.endsWith('_'+me.uid),votes:id.endsWith('_'+me.uid),follows:id.startsWith(me.uid+'_'),blocks:id.startsWith(me.uid+'_'),reads:id.endsWith('_'+me.uid),profiles:id==me.uid}[col];
+  const ok={likes:id.endsWith('_'+me.uid),saves:id.endsWith('_'+me.uid),views:id.endsWith('_'+me.uid),votes:id.endsWith('_'+me.uid),follows:id.startsWith(me.uid+'_'),blocks:id.startsWith(me.uid+'_'),cfriends:id.startsWith(me.uid+'_'),reads:id.endsWith('_'+me.uid),profiles:id==me.uid}[col];
   if(ok===false)return send(res,403,{error:'bad id'});
   if(col=='messages'){const pp=String(d.pair).split('|');if(!pp.includes(me.uid))return send(res,403,{error:'bad chat'});const ot=pp.find(x=>x!=me.uid);if(Object.values(D.docs.blocks||{}).some(x=>(x.d.a==me.uid&&x.d.b==ot)||(x.d.a==ot&&x.d.b==me.uid)))return send(res,403,{error:'cannot message this user'})}
-  if(col=='profiles')d.username=me.username;
+  {const X=ctx(me);
+   if(col=='comments'){if(!X.pOk(d.p))return send(res,403,{error:'you cannot comment on this post'});const po=X.posts[d.p];if(po.d.nc&&po.d.uid!=me.uid)return send(res,403,{error:'comments are turned off'})}
+   if(col=='likes'&&!(X.pOk(d.p)||X.cOk(d.p)||X.mOk(d.p)))return send(res,403,{error:'not allowed'});
+   if(col=='saves'&&!X.pOk(d.p))return send(res,403,{error:'not allowed'});
+   if((col=='views'||col=='votes')&&!X.sOk(d.s))return send(res,403,{error:'not allowed'});
+   if(col=='follows'&&m!='PATCH'&&X.bl.has(d.b))return send(res,403,{error:'not allowed'});
+   if(col=='stories'&&d.aud&&d.aud!='cf')delete d.aud}
+  if(col=='profiles'){d.username=me.username;delete d.fr;delete d.fg;delete d.np}
   const old=C[id];if(old&&old.o!=me.uid)return send(res,403,{error:'not yours'});
   if(m=='PATCH'){if(!old)return send(res,404,{error:'missing'});C[id]={o:me.uid,d:{...old.d,...d}}}else C[id]={o:me.uid,d};
   save();return send(res,200,{id})}
